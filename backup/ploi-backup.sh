@@ -28,7 +28,7 @@ KEEP_WEEKLY=8
 KEEP_MONTHLY=6
 REPORT_WEEKDAY=7             # 1=ma .. 7=zo: prune, integriteitscheck en weekrapport
 CHECK_SUBSET="5%"            # deel van de data dat wekelijks echt wordt gelezen
-MIN_GUARD_BYTES=1000000000   # lege-server-check pas vanaf 1 GB vorige backup
+MIN_GUARD_BYTES=1000000000   # krimpmelding pas vanaf 1 GB vorige backup
 KEEP_DB_HOURLY=48            # alleen voor de optionele 'db'-modus (bv. elk uur via een tweede schedule)
 KEEP_DB_DAILY=7
 
@@ -692,17 +692,14 @@ cmd_backup() {
   fi
   backup_paths
 
-  STEP="controle op lege server"
+  STEP="vergelijken met vorige backup"
   local last now
   last="$(r snapshots --host "$SERVER_NAME" --tag ploi-backup --latest 1 --json | jq -r '[.[].summary.total_bytes_processed // 0] | max // 0')"
   now="$( { du -sbx "${PATHS[@]}" 2>/dev/null || true; } | awk '{s+=$1} END {print s+0}')"
   say "vorige backup $((last/1048576)) MB, nu op schijf $((now/1048576)) MB"
-  if [ "$last" -gt "$MIN_GUARD_BYTES" ] && [ "$now" -lt $((last / 2)) ] && [ "${FORCE:-0}" != 1 ]; then
-    discord "⚠️ **Backup overgeslagen op \`$SERVER_NAME\`** ($ORG): de server is veel kleiner dan de vorige backup ($((now/1048576)) MB nu, $((last/1048576)) MB toen). Herbouwde of leeggemaakte server? Eerst restoren, of eenmalig als root \`FORCE=1 $BIN backup\`."
-    hc /fail
-    rm -rf "$DUMP_DIR"
-    trap - ERR
-    exit 0
+  # Alleen melden, nooit overslaan: bewust kleiner gemaakt kan net zo goed als per ongeluk leeg
+  if [ "$last" -gt "$MIN_GUARD_BYTES" ] && [ "$now" -lt $((last / 2)) ]; then
+    discord "⚠️ \`$SERVER_NAME\` ($ORG) is veel kleiner dan bij de vorige backup ($((now/1048576)) MB nu, $((last/1048576)) MB toen). De backup gaat gewoon door en de oudere backups blijven bewaard. Niet bewust? Kijk dan meteen."
   fi
 
   STEP="bestanden backuppen"
@@ -1204,7 +1201,7 @@ Gebruik: $BIN [run|setup|backup|status|restic ...]
   run     (standaard, Ploi schedule) start de volledige backup op de achtergrond
   run-db  alleen databases (optioneel, aparte Ploi schedule, bv. elk uur)
   setup   eenmalig inrichten (vraagt Hetzner-token en restic-wachtwoord)
-  backup  backup in de voorgrond: backup [full|db] (FORCE=1 negeert de lege-server-check)
+  backup  backup in de voorgrond: backup [full|db]
   status  laatste snapshots en log
   list    overzicht van alle backups: list [SITE] (met site: grootte van bestanden en database per backup)
   restore site + database terugzetten: restore SITE [--when latest|JJJJ-MM-DD|ID] [--apply] [--files-only|--db-only]

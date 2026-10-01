@@ -40,9 +40,9 @@ check "restore site: bestanden gelijk" "rm -rf /tmp/rt && $B restic restore late
 check "zonder MySQL-toegang: exit 0 + oranje melding" "mv /root/.backup-mysql.cnf /root/.bk; $B backup >/dev/null 2>&1; rc=\$?; mv /root/.bk /root/.backup-mysql.cnf; [ \$rc = 0 ] && tail -n1 /var/log/discord-mock/requests.log | jq -r .content | grep -q '🟠'"
 check "fout restic-wachtwoord: exit 12 + rode melding met log" "cp /root/.ploi-backup-test/env /root/e; sed -i 's/^RESTIC_PASSWORD=.*/RESTIC_PASSWORD=x/' /root/.ploi-backup-test/env; env -i PATH=/usr/bin:/bin timeout 60 $B backup >/dev/null 2>&1; rc=\$?; cp /root/e /root/.ploi-backup-test/env; [ \$rc = 12 ] && tail -n1 /var/log/discord-mock/requests.log | jq -r .content | grep -q 'wrong password'"
 check "db-run wijkt voor lopende backup" "(exec 9>/run/lock/ploi-backup-test.lock; flock 9; sleep 15) & sleep 1; $B backup db | grep -q 'draait al'; wait"
-check "lege server: overslaan + melding, FORCE=1 draait wel" "head -c 20000000 /dev/urandom > /home/ploi/site-a.nl/public/assets/groot.bin; $B backup >/dev/null 2>&1; mv /home/ploi /var/tmp/ploi.bak; $B backup >/dev/null 2>&1; s=\$(tail -n1 /var/log/discord-mock/requests.log | jq -r .content); FORCE=1 $B backup >/dev/null 2>&1; rc=\$?; mv /var/tmp/ploi.bak /home/ploi; grep -q overgeslagen <<<\"\$s\" && [ \$rc = 0 ]"
+check "veel kleiner: backup gaat door, wel een melding" "head -c 20000000 /dev/urandom > /home/ploi/site-a.nl/public/assets/groot.bin; $B backup >/dev/null 2>&1; n=\$($B restic snapshots --tag ploi-backup --json | jq length); mv /home/ploi /var/tmp/ploi.bak; $B backup >/dev/null 2>&1; rc=\$?; s=\$(tail -n2 /var/log/discord-mock/requests.log | jq -r .content); m=\$($B restic snapshots --tag ploi-backup --json | jq length); mv /var/tmp/ploi.bak /home/ploi; [ \$rc = 0 ] && grep -q 'veel kleiner' <<<\"\$s\" && [ \$m -ge \$n ]"
 # ---- terugzetten (site + database samen) ----
-x "$B backup" >/dev/null 2>&1   # verse backup na de lege-server-test
+x "$B backup" >/dev/null 2>&1   # verse backup na de krimptest
 check "list: alle backups met soort en grootte" "$B list | grep -q 'volledig' && $B list | grep -q 'Opslag op de Storage Box'"
 check "list SITE: bestanden en database per backup" "$B list wp2.nl | grep -qE 'volledig +[0-9.]+[KMG]?B +[0-9.]+[KMG]?B\$'"
 check "restore zonder site toont de lijst" "$B restore | grep -q 'Backups van'"

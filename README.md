@@ -80,7 +80,7 @@ Tip: met Hetzner Cloud Backups (een vinkje per server, 20% van de serverprijs) z
 | 🟢 | Eerste backup klaar, of het weekrapport (zondag). Alles werkt. |
 | 🟠 | Bestanden zijn gebackupt, maar er ging iets mis, bijvoorbeeld geen toegang tot MySQL. In de melding staat wat je moet doen. |
 | 🔴 | Mislukt. In de melding staan de laatste regels van de log. |
-| ⚠️ | Backup overgeslagen: de server is veel kleiner dan de vorige keer. Leeggemaakt of opnieuw opgebouwd? Eerst terugzetten. |
+| ⚠️ | De server is meer dan half zo klein als bij de vorige backup. De backup is gewoon gemaakt en de oudere blijven bewaard. Niet bewust (bijvoorbeeld sites weggehaald)? Kijk dan meteen. |
 | 🔧 | Server nog niet gekoppeld: vul het token in (zie *Per server*). |
 
 **Komt het weekrapport op zondag niet, kijk dan zelf.** Healthchecks.io doet dat automatisch voor je.
