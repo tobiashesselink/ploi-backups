@@ -33,6 +33,9 @@ check "zonder MySQL-toegang: exit 0 + oranje melding" "mv /root/.backup-mysql.cn
 check "fout restic-wachtwoord: exit 12 + rode melding met log" "cp /root/.ploi-backup-test/env /root/e; sed -i 's/^RESTIC_PASSWORD=.*/RESTIC_PASSWORD=x/' /root/.ploi-backup-test/env; env -i PATH=/usr/bin:/bin timeout 60 $B backup >/dev/null 2>&1; rc=\$?; cp /root/e /root/.ploi-backup-test/env; [ \$rc = 12 ] && tail -n1 /var/log/discord-mock/requests.log | jq -r .content | grep -q 'wrong password'"
 check "db-run wijkt voor lopende backup" "(exec 9>/run/lock/ploi-backup-test.lock; flock 9; sleep 15) & sleep 1; $B backup db | grep -q 'draait al'; wait"
 check "lege server: overslaan + melding, FORCE=1 draait wel" "head -c 20000000 /dev/urandom > /home/ploi/site-a.nl/public/assets/groot.bin; $B backup >/dev/null 2>&1; mv /home/ploi /var/tmp/ploi.bak; $B backup >/dev/null 2>&1; s=\$(tail -n1 /var/log/discord-mock/requests.log | jq -r .content); FORCE=1 $B backup >/dev/null 2>&1; rc=\$?; mv /var/tmp/ploi.bak /home/ploi; grep -q overgeslagen <<<\"\$s\" && [ \$rc = 0 ]"
+docker cp ../backup/ploi-script.sh "$C:/root/ploi-script.sh" >/dev/null
+check "Ploi-script: download van GitHub + checksum + backup" "sed 's/^export PB_ORG=\"\"/export PB_ORG=\"test\"/' /root/ploi-script.sh > /root/w.sh && bash /root/w.sh"
+check "Ploi-script: foute checksum valt terug op geïnstalleerde versie" "sed -e 's/^export PB_ORG=\"\"/export PB_ORG=\"test\"/' -e 's/^SHA256=.*/SHA256=\"0000\"/' /root/ploi-script.sh > /root/w2.sh && bash /root/w2.sh 2>&1 | grep -q 'geïnstalleerde versie'"
 docker compose stop storagebox >/dev/null 2>&1
 check "storage box onbereikbaar: exit != 0 binnen 90s" "! timeout 90 $B backup >/dev/null 2>&1 && tail -n1 /var/log/discord-mock/requests.log | jq -r .content | grep -q '🔴'"
 check "alle Discord-berichten geldige JSON" "while IFS= read -r l; do printf '%s' \"\$l\" | jq -e .content >/dev/null || exit 1; done < /var/log/discord-mock/requests.log"
