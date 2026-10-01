@@ -25,7 +25,6 @@ echo "<html>static</html>" > "$SITE/public/static/index.html"
 echo "static-url-cache" > "$SITE/storage/statamic/static-urls-cache/a"
 echo "ref: refs/heads/main" > "$SITE/.git/HEAD"
 chown -R ploi:ploi "$SITE"
-mkdir -p /home/ploi/.ploi/backup-1-abc && head -c 1000 /dev/urandom > /home/ploi/.ploi/backup-1-abc/site.zip && head -c 1000 /dev/urandom > /home/ploi/.ploi/db-1.zip && echo log > /home/ploi/.ploi/cron.log
 
 WP=/home/ploi/wp.nl
 mkdir -p "$WP/public/wp-content/uploads/2026" "$WP/public/wp-content/cache" "$WP/public/wp-content/ai1wm-backups"

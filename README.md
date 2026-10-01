@@ -28,6 +28,18 @@ De servernaam in de backups is de hostname. Wil je een andere naam, bijvoorbeeld
 
 ---
 
+## Overzicht van de backups
+
+Maak één keer een Ploi-script `ploi-backup-list` (user **root**) met als inhoud alleen:
+```bash
+/usr/local/sbin/ploi-backup list
+```
+Je krijgt dan per backup het ID, de datum en tijd, de soort (volledig, database of veiligheid) en de grootte, en daaronder de sites.
+
+Zet je er een site achter, bijvoorbeeld `/usr/local/sbin/ploi-backup list voorbeeld.nl`, dan zie je per backup hoe groot de bestanden en de database van die site zijn. Het ID gebruik je bij het terugzetten. Via SSH werkt hetzelfde commando: `ploi-backup list`.
+
+---
+
 ## Terugzetten
 
 Maak één keer een Ploi-script `ploi-backup-restore` (user **root**):
@@ -47,14 +59,14 @@ export RESTORE_APPLY=0                # 0 = proef, 1 = echt terugzetten
 
 **Variaties:**
 - Alleen de database: zet `export RESTORE_PART=db` erbij. Alleen de bestanden: `export RESTORE_PART=files`.
-- Welke backups er zijn: run het script met `RESTORE_SITE=""`. Je krijgt dan een lijst met data, ID's en sites.
 - Via SSH, als root, met dezelfde opties: `ploi-backup restore voorbeeld.nl`, met `--apply`, `--when 2026-09-30` en `--db-only`/`--files-only`. Gebruik SSH bij grote sites, als Ploi te lang moet wachten.
 
 **Hele server weg?**
 1. Maak de server opnieuw aan in Ploi, met dezelfde sites en (lege) databases. Geef de database-users hetzelfde wachtwoord als in de `.env` of `wp-config.php` uit de backup. Dat wachtwoord vind je met een proef-restore.
 2. Zet in het Ploi-script `ploi-backup` tijdelijk het token, `export PB_SERVER_NAME="oude naam"` en `export PB_ADOPT=1`. Run het. De server wordt dan aan zijn oude backups gekoppeld. **Zet de schedule nog niet aan.**
 3. Zet per site terug met `ploi-backup-restore` (`RESTORE_APPLY=1`).
-4. Haal het token, `PB_SERVER_NAME` en `PB_ADOPT` weer weg, en zet de schedule aan.
+4. Maak de cronjobs en queue workers opnieuw aan in Ploi. Hoe ze waren ingesteld, zie je in de backup: `/etc/crontab` en `/etc/supervisor/conf.d/`.
+5. Haal het token, `PB_SERVER_NAME` en `PB_ADOPT` weer weg, en zet de schedule aan.
 
 Tip: met Hetzner Cloud Backups (een vinkje per server, 20% van de serverprijs) zet je een hele server sneller terug. ploi-backup is dan je tweede, losse kopie.
 
@@ -91,7 +103,8 @@ Een nieuwe versie staat bij [Releases](../../releases). Zet `VERSION` en `SHA256
 
 - **Wat gaat mee:**
   - `/home`: alle sites, inclusief `.env`, uploads, `vendor` en `.git`
-  - `/etc`, `/root` en `/usr/local/sbin`
+  - `/etc`, met daarin ook de cronjobs (`/etc/crontab`) en de queue workers (`/etc/supervisor/conf.d`) van Ploi
+  - `/root`, `/usr/local/sbin`, `/opt` en `/var/spool/cron`
   - een dump van elke MySQL/MariaDB-database (zonder locks), plus de database-users met hun rechten
   - een dump van elke SQLite-database onder `/home`
 - **Wat niet:** caches die vanzelf opnieuw worden opgebouwd:

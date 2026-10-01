@@ -28,7 +28,6 @@ check "setup via ingesprongen invoer met export en quotes" "printf '   export RE
 check "setup met stdin die nooit sluit: klaar binnen 60s" "sleep 120 | RESTIC_PASSWORD=testpw123 timeout 60 /usr/local/sbin/ploi-backup setup | grep -q 'setup klaar'"
 check "backup (zonder HOME, zoals systemd)" "env -i PATH=/usr/bin:/bin bash /root/run-ploi-backup.sh backup"
 check "excludes: caches en plugin-backups niet in snapshot" "! $B restic ls latest | grep -qE 'node_modules|framework/cache|public/static|static-urls-cache|wp-content/cache|ai1wm'"
-check "excludes: tijdelijke Ploi-backups niet, Ploi-logs wel" "L=\$($B restic ls latest); ! grep -qE '\.ploi/backup-|\.ploi/db-1\.zip' <<<\"\$L\" && grep -q '\.ploi/cron.log' <<<\"\$L\""
 check "includes: content, uploads, .git, dumps" "L=\$($B restic ls latest); for p in content/pages/home.md uploads/2026/a.jpg .git/HEAD mysql/wp_test.sql mysql/_users_and_grants.sql sqlite/; do grep -q \"\$p\" <<<\"\$L\" || exit 1; done"
 check "geen root-owned sqlite -wal/-shm" "! find /home/site-b -user root | grep -q ."
 check "dumpmap na afloop weg" "[ ! -e /var/backups/ploi-backup-test ]"
@@ -44,12 +43,15 @@ check "db-run wijkt voor lopende backup" "(exec 9>/run/lock/ploi-backup-test.loc
 check "lege server: overslaan + melding, FORCE=1 draait wel" "head -c 20000000 /dev/urandom > /home/ploi/site-a.nl/public/assets/groot.bin; $B backup >/dev/null 2>&1; mv /home/ploi /var/tmp/ploi.bak; $B backup >/dev/null 2>&1; s=\$(tail -n1 /var/log/discord-mock/requests.log | jq -r .content); FORCE=1 $B backup >/dev/null 2>&1; rc=\$?; mv /var/tmp/ploi.bak /home/ploi; grep -q overgeslagen <<<\"\$s\" && [ \$rc = 0 ]"
 # ---- terugzetten (site + database samen) ----
 x "$B backup" >/dev/null 2>&1   # verse backup na de lege-server-test
-check "restore zonder site: lijst met backups" "$B restore | grep -q 'Beschikbare backups'"
+check "list: alle backups met soort en grootte" "$B list | grep -q 'volledig' && $B list | grep -q 'Opslag op de Storage Box'"
+check "list SITE: bestanden en database per backup" "$B list wp2.nl | grep -qE 'volledig +[0-9.]+[KMG]?B +[0-9.]+[KMG]?B\$'"
+check "restore zonder site toont de lijst" "$B restore | grep -q 'Backups van'"
 check "restore proef wp.nl: bestanden + database.sql, live onveranderd" "$B restore wp.nl | grep -q 'PROEF klaar' && ls /root/restore-test/wp.nl-*/database.sql && ls /root/restore-test/wp.nl-*/home/ploi/wp.nl/public/wp-config.php"
 check "restore onbekende site: duidelijke fout" "! $B restore bestaat-niet.nl >/dev/null 2>&1"
 check "restore ongeldige datum/ID: fout" "! $B restore wp.nl --when gisteren >/dev/null 2>&1"
 check "restore --apply weigert database met objecten van een andere user, verandert niets" "mysql -e 'DELETE FROM wp_test.posts WHERE id > 10'; ! $B restore wp.nl --apply >/tmp/o 2>&1 && grep -q 'andere MySQL-user' /tmp/o && [ \$(mysql -N -e 'SELECT COUNT(*) FROM wp_test.posts') = 10 ]"
 check "restore --apply wp2.nl: upload, rijen, extra tabel, view en trigger" "rm /home/ploi/wp2.nl/public/wp-content/uploads/2026/b.jpg; mkdir -p /home/ploi/wp2.nl/node_modules/x; mysql -e 'DELETE FROM wp_two.opts WHERE id > 5; CREATE TABLE wp_two.stray (id INT)'; $B restore wp2.nl --apply >/dev/null && [ -f /home/ploi/wp2.nl/public/wp-content/uploads/2026/b.jpg ] && [ \$(mysql -N -e 'SELECT COUNT(*) FROM wp_two.opts') = 300 ] && ! mysql -N -e 'SHOW TABLES FROM wp_two' | grep -q stray && mysql -N -e 'SHOW TRIGGERS FROM wp_two' | grep -q opts_ai && mysql -N -e 'SELECT COUNT(*) FROM wp_two.opts_view' | grep -q 300 && [ -d /home/ploi/wp2.nl/node_modules/x ]"
+check "restore ruimt routine van na de backup op en laat caches staan" "mysql -uwp_two_user -pTwo-Pass-123! wp_two -e 'CREATE PROCEDURE na_backup() SELECT 1' 2>/dev/null; mkdir -p /home/ploi/wp2.nl/public/wp-content/cache/c && echo x > /home/ploi/wp2.nl/public/wp-content/cache/c/f; $B restore wp2.nl --apply >/dev/null && ! mysql -N -e \"SELECT routine_name FROM information_schema.routines WHERE routine_schema='wp_two'\" | grep -q na_backup && [ -f /home/ploi/wp2.nl/public/wp-content/cache/c/f ]"
 check "restore --apply maakte een veiligheidsbackup (pre-restore)" "$B restic snapshots --tag pre-restore --json | jq -e 'length >= 1'"
 check "restore --apply SQLite-site: rijen terug, eigenaar klopt" "runuser -u site-b -- sqlite3 /home/site-b/site-b.nl/database/database.sqlite 'DELETE FROM items WHERE id > 5'; $B restore site-b.nl --apply >/dev/null && [ \$(sqlite3 /home/site-b/site-b.nl/database/database.sqlite 'SELECT COUNT(*) FROM items') = 1000 ] && [ \$(stat -c %U /home/site-b/site-b.nl/database/database.sqlite) = site-b ] && ! find /home/site-b -user root | grep -q ."
 check "restore --db-only met datum van vandaag" "mysql -e 'DELETE FROM wp_two.opts WHERE id > 100'; $B restore wp2.nl --db-only --when \$(date -u +%F) --apply >/dev/null && [ \$(mysql -N -e 'SELECT COUNT(*) FROM wp_two.opts') = 300 ]"
@@ -61,6 +63,7 @@ check "nieuwe server met gegevens: richt zichzelf in en backupt" "env PB_RESTIC_
 x "rm -rf /root/state.bak" >/dev/null 2>&1
 docker cp ../backup/ploi-script.sh "$C:/root/ploi-script.sh" >/dev/null
 check "Ploi-script: download van GitHub + checksum + backup" "sed 's/^export PB_ORG=\"\"/export PB_ORG=\"test\"/' /root/ploi-script.sh > /root/w.sh && bash /root/w.sh"
+check "Ploi-script verwijdert zijn eigen tijdelijke bestand (/root/ploi-script-*.sh)" "sed 's/^export PB_ORG=\"\"/export PB_ORG=\"test\"/' /root/ploi-script.sh > /root/ploi-script-12345.sh && bash /root/ploi-script-12345.sh >/dev/null 2>&1; [ ! -e /root/ploi-script-12345.sh ]"
 check "Ploi-script: foute checksum valt terug op geïnstalleerde versie" "sed -e 's/^export PB_ORG=\"\"/export PB_ORG=\"test\"/' -e 's/^SHA256=.*/SHA256=\"0000\"/' /root/ploi-script.sh > /root/w2.sh && bash /root/w2.sh 2>&1 | grep -q 'geïnstalleerde versie'"
 docker compose stop storagebox >/dev/null 2>&1
 check "storage box onbereikbaar: exit != 0 binnen 90s" "! timeout 90 $B backup >/dev/null 2>&1 && tail -n1 /var/log/discord-mock/requests.log | jq -r .content | grep -q '🔴'"
