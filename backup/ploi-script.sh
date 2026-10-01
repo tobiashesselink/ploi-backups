@@ -6,8 +6,8 @@ export PB_STORAGEBOX_ID=""       # Hetzner Console > Storage Box > ID (getal)
 export PB_DISCORD_WEBHOOK=""     # Discord-kanaal > Integraties > Webhook-URL
 export PB_HC_PING_KEY=""         # optioneel: Healthchecks.io ping key
 # ---- Versie (alleen aanpassen bij een update, zie README) -----------
-VERSION="v1.0.0"
-SHA256="1fa228f43cd4fd6160b9567c1f25388e9aaaa2e1eb268f29b3fff09277894e39"
+VERSION="v1.0.1"
+SHA256="97a6681863c87bc9b1a258ac0564af0e4046563384ce6491cb525410492a35cc"
 # ---------------------------------------------------------------------
 set -euo pipefail
 URL="https://raw.githubusercontent.com/tobiashesselink/ploi-backups/$VERSION/backup/ploi-backup.sh"

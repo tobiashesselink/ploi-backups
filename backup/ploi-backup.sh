@@ -161,6 +161,8 @@ install_self() {
   DISCORD_WEBHOOK="$cur_dw"; HC_PING_KEY="$cur_hc"
   chmod 700 "$tmp"
   mv -f "$tmp" "$BIN"
+  # Korte naam zonder org, zodat commando's in de README altijd gelijk zijn
+  ln -sfn "$BIN" /usr/local/sbin/ploi-backup
 }
 
 # ======================================================================
@@ -300,7 +302,7 @@ chmod 600 .ssh/authorized_keys
 chmod 700 .ssh
 SFTP
     if key_works; then rm -rf "$tmp"; return 0; fi
-    say "SSH-key werkt nog niet (poging $i/12), wacht 10s"
+    say "wachten tot Hetzner het sub-account activeert (duurt meestal 1-2 min, poging $i/12)"
     sleep 10
   done
   rm -rf "$tmp"
@@ -418,13 +420,18 @@ cmd_setup() {
   # Secrets kunnen als KEY=waarde-regels via stdin komen (pipe of fifo), zodat ze nooit in argv of bestanden staan
   SETUP_INTERACTIVE=0
   if [ -t 0 ]; then SETUP_INTERACTIVE=1; else
-    local line k
-    while IFS= read -r line || [ -n "$line" ]; do
-      k="${line%%=*}"
+    # Ongevoelig voor spaties, 'export ' en aanhalingstekens; stopt na 5 s stilte (stdin die nooit sluit)
+    local line k v
+    while IFS= read -r -t 5 line || [ -n "$line" ]; do
+      line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+      line="${line#export }"
+      k="${line%%=*}"; v="${line#*=}"
+      v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
       case "$k" in
         HETZNER_TOKEN|RESTIC_PASSWORD|DISCORD_WEBHOOK|HC_PING_KEY|SB_USER|SB_HOST|SB_PASSWORD|SETUP_SERVER_NAME|SETUP_MYSQL|ADOPT)
-          printf -v "$k" '%s' "${line#*=}" ;;
+          printf -v "$k" '%s' "$v" ;;
       esac
+      line=""
     done
   fi
   [ -n "${SETUP_SERVER_NAME:-}" ] && SERVER_NAME="$SETUP_SERVER_NAME"
@@ -769,7 +776,7 @@ cmd_status() {
   echo "org=$ORG server=$SERVER_NAME repo=${SB_USER:-?}@${SB_HOST:-?}:restic"
   systemctl status "$UNIT" --no-pager 2>/dev/null | head -5 || true
   [ -f "$ENV_FILE" ] && r snapshots --host "$SERVER_NAME" --latest 5 || true
-  [ -f "$LOG" ] && { echo "--- laatste log"; tail -n 15 "$LOG"; }
+  if [ -f "$LOG" ]; then echo "--- laatste log"; tail -n 15 "$LOG"; fi
 }
 
 usage() {

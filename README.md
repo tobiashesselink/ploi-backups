@@ -30,17 +30,15 @@ Je hebt **Ploi** en een **Hetzner-account** nodig. Root-toegang tot de servers i
 ### Per server
 
 1. **Installeren.** Ploi > *Scripts* > `ploi-backup` > *Run* op de server. Je ziet *"nog niet ingericht"*. Dat klopt.
-2. **Koppelen.** Maak een tweede Ploi-script `ploi-backup-setup` (user **root**) met de inhoud hieronder. Vul het in, run het op de server, en **maak het script daarna weer leeg**: Ploi bewaart scripts als platte tekst.
+2. **Koppelen.** Maak een tweede Ploi-script `ploi-backup-setup` (user **root**) met de inhoud hieronder. Vul de drie waarden in, run het op de server, en **maak het script daarna weer leeg**: Ploi bewaart scripts als platte tekst.
    ```bash
-   /usr/local/sbin/ploi-backup-ORG setup <<'EOF'
-   HETZNER_TOKEN=het-api-token
-   RESTIC_PASSWORD=het-restic-wachtwoord
-   SETUP_SERVER_NAME=naam-van-de-server
-   SETUP_MYSQL=1
-   EOF
+   export HETZNER_TOKEN="het-api-token"
+   export RESTIC_PASSWORD="het-restic-wachtwoord"
+   export SETUP_SERVER_NAME="server-naam-uit-ploi"
+   export SETUP_MYSQL=1
+   /usr/local/sbin/ploi-backup setup </dev/null
    ```
-   - `ORG` is wat je bij `PB_ORG` hebt ingevuld.
-   - `SETUP_SERVER_NAME` is de naam waaronder de server in de backups staat. Neem bijvoorbeeld de naam uit Ploi. Laat je de regel weg, dan wordt het de hostname.
+   - `SETUP_SERVER_NAME` is de naam waaronder de server in de backups staat. **Neem de servernaam uit Ploi**, en houd die daarna altijd hetzelfde.
    - `SETUP_MYSQL=1` maakt een MySQL-gebruiker die alleen kan lezen. Daarvoor **herstart MySQL één keer**, een paar seconden. Doe dit op een rustig moment. Laat de regel weg als de server geen MySQL heeft.
    - Gelukt? Dan krijg je een 🆕-bericht in Discord.
 3. **Inplannen.** Ploi > *Scripts* > `ploi-backup` > *Schedule*: dagelijks, op de server, op een rustige tijd. Bijvoorbeeld `30 3 * * *` (03:30, servertijd is meestal UTC). Heb je meerdere servers, laat ze dan minstens 30 minuten na elkaar starten.
@@ -68,12 +66,12 @@ Klaar. De eerste backup kun je meteen starten met *Run*. Een nieuwe server toevo
 
 ## Terugzetten
 
-Log in als root op de server. `ORG` is je `PB_ORG`.
+Log in als root op de server. Waar `ORG` staat, vul je je `PB_ORG` in.
 
 **Zet altijd eerst terug naar `/root/restore-test`, en nooit direct over een live site heen.**
 
 ```bash
-B=ploi-backup-ORG
+B=ploi-backup
 $B restic snapshots                       # overzicht van alle snapshots
 ```
 
@@ -103,7 +101,7 @@ Vervang daarna het bestand van de site door deze nieuwe database, met de site ev
 
 **De hele server is weg:**
 1. Maak de server opnieuw aan in Ploi, met dezelfde sites, system users en (lege) databases.
-2. Run `ploi-backup` één keer, en daarna `ploi-backup-setup` met dezelfde `SETUP_SERVER_NAME`, hetzelfde restic-wachtwoord en een extra regel `ADOPT=1`. De server wordt dan gekoppeld aan zijn oude backups. **Zet de schedule nog niet aan.**
+2. Run `ploi-backup` één keer, en daarna `ploi-backup-setup` met dezelfde `SETUP_SERVER_NAME`, hetzelfde restic-wachtwoord en een extra regel `export ADOPT=1`. De server wordt dan gekoppeld aan zijn oude backups. **Zet de schedule nog niet aan.**
 3. Zet alles terug:
    - de sites: `restore --tag ploi-backup ... --include /home`, en daarna per site `rsync` en `chown -R user:user`
    - de databases, zoals hierboven
@@ -118,7 +116,7 @@ Tip: Hetzner Cloud Backups (een vinkje per server in de Console, kost 20% van de
 
 Kun je voor één site of app geen dag aan data missen? Maak dan een Ploi-script `ploi-backup-db` (user **root**) met als inhoud alleen:
 ```bash
-/usr/local/sbin/ploi-backup-ORG run-db
+/usr/local/sbin/ploi-backup run-db
 ```
 Plan het in op die server, bijvoorbeeld elk uur (`15 * * * *`).
 - Er gaan dan alleen databasedumps mee, met een eigen bewaartermijn: 48 uur en 7 dagen.
@@ -154,7 +152,7 @@ Een nieuwe versie staat bij [Releases](../../releases), samen met de bijbehorend
 **Zo loopt het:**
 1. Ploi start `ploi-script.sh`.
 2. Dat haalt deze repo op, op precies de vaste `VERSION`, en controleert de `SHA256`. Een gewijzigde repo kan dus niets ongemerkt uitvoeren.
-3. Het script installeert zich als `/usr/local/sbin/ploi-backup-ORG`.
+3. Het script installeert zich als `/usr/local/sbin/ploi-backup-ORG`, met de korte naam `ploi-backup` ernaast.
 4. Het start de backup op de achtergrond, via systemd. Daardoor maakt het niet uit hoe lang die duurt.
 5. Is GitHub niet bereikbaar, dan draait de al geïnstalleerde versie.
 
@@ -179,9 +177,9 @@ Een nieuwe versie staat bij [Releases](../../releases), samen met de bijbehorend
 
 **Handige commando's** (als root):
 ```bash
-ploi-backup-ORG status           # laatste snapshots en log
-ploi-backup-ORG backup           # backup nu, in de voorgrond
-ploi-backup-ORG restic ...       # elke restic-opdracht, met de juiste repo en het juiste wachtwoord
+ploi-backup status               # laatste snapshots en log
+ploi-backup backup               # backup nu, in de voorgrond
+ploi-backup restic ...           # elke restic-opdracht, met de juiste repo en het juiste wachtwoord
 ```
 
 ---
@@ -191,9 +189,10 @@ ploi-backup-ORG restic ...       # elke restic-opdracht, met de juiste repo en h
 | Probleem | Oplossing |
 |---|---|
 | *nog niet ingericht* | Stap 2 per server (`ploi-backup-setup`) |
+| *ploi-backup: No such file or directory* | Eerst stap 1: `ploi-backup` één keer runnen op de server |
 | *geen MySQL-toegang* | `ploi-backup-setup` opnieuw runnen met `SETUP_MYSQL=1`. Zonder `HETZNER_TOKEN` mag ook: alleen `RESTIC_PASSWORD` is nodig. |
 | *restic-wachtwoord klopt niet* | Gebruik het wachtwoord uit je wachtwoordmanager. Een fout wachtwoord in setup verandert niets aan een werkende server. |
-| *repository is already locked* | Draait er nog een backup? `systemctl status ploi-backup-ORG`. Zo niet: `ploi-backup-ORG restic unlock`. |
+| *repository is already locked* | Draait er nog een backup? `systemctl status ploi-backup-ORG`. Zo niet: `ploi-backup restic unlock`. |
 | *downloaden of checksum mislukt* (in de Ploi-output) | Kloppen `VERSION` en `SHA256` met de release? Tot dat is opgelost draait de al geïnstalleerde versie gewoon door. |
 | Storage Box niet bereikbaar | Uitgaand verkeer op poort 23 moet open staan. Kijk ook op [status.hetzner.com](https://status.hetzner.com). |
 
