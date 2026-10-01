@@ -50,10 +50,10 @@ export RESTORE_APPLY=0                # 0 = proef, 1 = echt terugzetten
 /usr/local/sbin/ploi-backup restore
 ```
 
-1. **Proef** (`RESTORE_APPLY=0`). Er verandert niets live. De bestanden en de database komen in `/root/restore-test`, zodat je ze kunt bekijken.
+1. **Proef** (`RESTORE_APPLY=0`). Er verandert niets live. De bestanden en de database komen in `/root/restore-test`, zodat je ze kunt bekijken. Na 7 dagen ruimt het script ze vanzelf op.
 2. **Echt** (`RESTORE_APPLY=1`). De site en de database die erbij hoort gaan samen terug. De database staat in `.env` of `wp-config.php`. Er gebeurt dit:
    1. Eerst wordt vanzelf een **veiligheidsbackup** van de huidige staat gemaakt.
-   2. Daarna gaat de site even in onderhoud (Laravel en Statamic).
+   2. Daarna gaat de site even in onderhoud (Laravel, Statamic en WordPress).
    3. Dan worden de bestanden en de database teruggezet en de caches geleegd.
 3. **Ongedaan maken?** In de ♻️-melding staat het ID van de veiligheidsbackup. Zet dat ID bij `RESTORE_WHEN` en run het opnieuw met `RESTORE_APPLY=1`.
 
@@ -121,13 +121,16 @@ Een nieuwe versie staat bij [Releases](../../releases). Zet `VERSION` en `SHA256
   3. Het script installeert zich als `/usr/local/sbin/ploi-backup`.
   4. Het start de backup op de achtergrond, met de laagste CPU- en IO-prioriteit.
   5. Is GitHub niet bereikbaar, dan draait de versie die al op de server staat.
-- **Belasting:** gemeten op een server met 2 vCPU en 9 sites (12 GB). De eerste backup duurde 2,5 minuut, een volgende ongeveer 1 minuut. De responstijd van de sites bleef gelijk.
+- **Belasting:** laag. Na de eerste backup duurt een run meestal 1 à 2 minuten, en de sites merken er niets van. Een run die vastloopt, wordt na 12 uur afgebroken en gemeld.
 - **Beveiliging:**
   - Elke server heeft een eigen sub-account op de Storage Box, in `servers/<naam>`, en kan niet bij de backups van andere servers.
   - De backups zijn versleuteld met het restic-wachtwoord.
   - Het API-token wordt nergens opgeslagen.
   - Het tijdelijke scriptbestand dat Ploi op de server zet, haalt het script meteen weg.
-  - Op de server staan alleen bestanden die alleen root kan lezen: `/root/.ploi-backup-<org>/` (wachtwoord en SSH-key) en `/root/.backup-mysql.cnf` (een MySQL-user die alleen kan lezen).
+  - Op de server staan alleen bestanden die alleen root kan lezen:
+    - `/root/.ploi-backup-<org>/`: het wachtwoord en de SSH-key
+    - `/root/.backup-mysql.cnf`: een MySQL-user die alleen kan lezen
+    - `/usr/local/sbin/ploi-backup-<org>`: de geïnstalleerde kopie, met de Discord-webhook
 
 **Handige commando's** (via SSH, als root):
 ```bash

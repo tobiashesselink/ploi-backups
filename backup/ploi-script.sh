@@ -11,21 +11,20 @@ export PB_HC_PING_KEY=""         # optioneel: Healthchecks.io ping key
 export PB_HETZNER_TOKEN=""       # alleen invullen om een nieuwe server te koppelen, daarna weer leeg
 # ---- Versie (alleen aanpassen bij een update, zie README) -----------
 VERSION="v1.1.0"
-SHA256="vul-in-bij-release"
+SHA256="d56c8ac45b5461fffa07b7186e4ac99c193e5ea1f7ec2dc439ba607a78b81e84"
 # ---------------------------------------------------------------------
 set -euo pipefail
 URL="https://raw.githubusercontent.com/tobiashesselink/ploi-backups/$VERSION/backup/ploi-backup.sh"
 BIN="/usr/local/sbin/ploi-backup-$PB_ORG"
-MODE="${1:-run}"
 tmp="$(mktemp)"
 if curl -fsSL -m 60 --retry 3 -o "$tmp" "$URL" && echo "$SHA256  $tmp" | sha256sum -c --quiet -; then
-  rc=0; bash "$tmp" "$MODE" || rc=$?
+  rc=0; bash "$tmp" run || rc=$?
   rm -f "$tmp"; exit "$rc"
 fi
 rm -f "$tmp"
 echo "ploi-backup: downloaden of checksum van $VERSION mislukt." >&2
 if [ -x "$BIN" ]; then
   echo "ploi-backup: de al geïnstalleerde versie wordt gebruikt." >&2
-  exec "$BIN" "$MODE"
+  exec "$BIN" run
 fi
 exit 1

@@ -108,11 +108,12 @@ r() { restic -o sftp.command="ssh -F $SSH_CFG $SSH_ALIAS -s sftp" "$@"; }
 # Log naar bestand én naar de originele stdout (journal of terminal).
 # fd 3/4 = originele stdout/stderr, fd 5 = de pipe naar tee (ook bruikbaar waar stdout omgeleid is).
 start_log() { # start_log BESTAND [append]
+  if [ "${2:-}" = append ] && [ -f "$1" ]; then tail -n 2000 "$1" > "$1.tmp" && mv -f "$1.tmp" "$1"; fi
   exec 3>&1 4>&2
   if [ "${2:-}" = append ]; then exec > >(tee -a "$1" >&3) 2>&1; else exec > >(tee "$1" >&3) 2>&1; fi
   TEE_PID=$!
   exec 5>&1
-  LOG_ACTIVE=1
+  LOG_FILE="$1"; LOG_ACTIVE=1
   trap stop_log EXIT
 }
 # Bij afsluiten: pipe sluiten en wachten tot tee alles heeft weggeschreven (systemd kan tee anders afschieten)
@@ -124,7 +125,16 @@ stop_log() {
   TEE_PID=""
 }
 
-tail_log() { if [ "${LOG_ACTIVE:-0}" = 1 ] && [ -f "$LOG" ]; then tail -n "${1:-15}" "$LOG" | cut -c1-200; fi; }
+tail_log() { if [ "${LOG_ACTIVE:-0}" = 1 ] && [ -f "$LOG_FILE" ]; then tail -n "${1:-15}" "$LOG_FILE" | cut -c1-200; fi; }
+
+# Afgebroken (TERM/HUP/INT): tee is dan mogelijk al gestopt, dus direct naar het logbestand en de originele uitvoer
+on_signal() { # on_signal FOUTAFHANDELING
+  trap '' PIPE TERM HUP INT
+  if [ -n "${TEE_PID:-}" ]; then exec 1>&3 2>&4; TEE_PID=""; fi
+  [ "${LOG_ACTIVE:-0}" = 1 ] && echo "[$(date -u +%H:%M:%S)] afgebroken in stap: $STEP" >> "$LOG_FILE"
+  STEP="$STEP (afgebroken)"
+  "$1" 143
+}
 
 on_error() {
   local rc=$?
@@ -133,7 +143,7 @@ on_error() {
   if [ "$BASH_SUBSHELL" -gt 0 ]; then return "$rc"; fi
   trap - ERR
   # De trap kan afgaan binnen een functie met >/dev/null (bv. r cat config): terug naar de log
-  if [ "${LOG_ACTIVE:-0}" = 1 ]; then exec 1>&5 2>&5; fi
+  if [ -n "${TEE_PID:-}" ]; then exec 1>&5 2>&5; fi
   say "Gestopt met exitcode $rc in stap: $STEP"
   sleep 1
   hc /fail
@@ -329,7 +339,7 @@ write_env() {
   {
     echo "# ploi-backup $ORG, aangemaakt door setup op $(date -u -Is)"
     printf 'SERVER_NAME=%q\n' "$SERVER_NAME"
-    printf 'SB_USER=%q\nSB_HOST=%q\nSB_SUBACCOUNT_ID=%q\n' "$SB_USER" "$SB_HOST" "${SB_SUBACCOUNT_ID:-}"
+    printf 'SB_USER=%q\nSB_HOST=%q\n' "$SB_USER" "$SB_HOST"
     printf 'RESTIC_PASSWORD=%q\n' "$RESTIC_PASSWORD"
     printf 'DISCORD_WEBHOOK=%q\nHC_PING_KEY=%q\n' "${DISCORD_WEBHOOK:-}" "${HC_PING_KEY:-}"
   } > "$ENV_FILE.tmp"
@@ -371,7 +381,6 @@ provision_subaccount() {
     SETUP_NOTE="♻️ Bestaande backup-opslag gekoppeld aan \`$SERVER_NAME\` ($ORG, herbouwde server?)"
   fi
   resp="$(api GET "/storage_boxes/$STORAGEBOX_ID/subaccounts/$sub_id")"
-  SB_SUBACCOUNT_ID="$sub_id"
   SB_USER="$(jq -r '.subaccount.username // empty' <<<"$resp")"
   SB_HOST="$(jq -r '.subaccount.server // empty' <<<"$resp")"
   [ -n "$SB_USER" ] && [ -n "$SB_HOST" ] || die "sub-account $sub_id: username/server ontbreken in API-antwoord"
@@ -415,6 +424,7 @@ cmd_setup() {
   chmod 700 "$STATE" "$LOGDIR"
   start_log "$LOGDIR/setup.log" append
   trap 'trap - ERR; exec 1>&5 2>&5; say "setup gestopt in stap: $STEP"' ERR
+  trap 'on_signal setup_abort' TERM HUP INT
   say "===== setup ploi-backup $ORG op $(hostname -s) ====="
   load_env
   # Secrets kunnen als KEY=waarde-regels via stdin komen (pipe of fifo), zodat ze nooit in argv of bestanden staan
@@ -529,8 +539,9 @@ dump_mysql() {
   fi
   if mysqldump --help 2>/dev/null | grep -q -- '--set-gtid-purged'; then extra+=(--set-gtid-purged=OFF); fi
   mkdir -p "$DUMP_DIR/mysql"
-  local dbs=()
-  mapfile -t dbs < <("${my[@]}" -e 'SHOW DATABASES' | { grep -Ev '^(information_schema|performance_schema|mysql|sys)$' || true; })
+  local dbs=() list
+  list="$("${my[@]}" -e 'SHOW DATABASES' 2>&1)" || { warn "lijst met databases ophalen mislukt: ${list:0:200}"; return 0; }
+  mapfile -t dbs < <(grep -Ev '^(information_schema|performance_schema|mysql|sys)$' <<<"$list" || true)
   for db in "${dbs[@]}"; do
     if mysqldump --defaults-extra-file="$MYSQL_CNF" --single-transaction --quick \
         --routines --triggers --events --hex-blob --no-tablespaces "${extra[@]}" \
@@ -544,29 +555,33 @@ dump_mysql() {
     fi
   done
   # Gebruikers en rechten (wachtwoorden als hash), zodat .env en wp-config na restore blijven kloppen
-  local u out="$DUMP_DIR/mysql/_users_and_grants.sql"
+  local u out="$DUMP_DIR/mysql/_users_and_grants.sql" users
   : > "$out"
-  while IFS=$'\t' read -r u; do
+  users="$("${my[@]}" -e "SELECT CONCAT(QUOTE(user),'@',QUOTE(host)) FROM mysql.user
+            WHERE user NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','debian-sys-maint','backup','')")" \
+    || { warn "databasegebruikers niet geëxporteerd"; return 0; }
+  while IFS= read -r u; do
     [ -n "$u" ] || continue
     { if [ "$IS_MARIADB" = 1 ]; then "${my[@]}" -e "SHOW CREATE USER $u"
       else "${my[@]}" -e "SET print_identified_with_as_hex=ON; SHOW CREATE USER $u"; fi | sed 's/$/;/'
       "${my[@]}" -e "SHOW GRANTS FOR $u" | sed 's/$/;/'; } >> "$out" 2>/dev/null \
       || warn "rechten van $u niet geëxporteerd"
-  done < <("${my[@]}" -e "SELECT CONCAT(QUOTE(user),'@',QUOTE(host)) FROM mysql.user
-            WHERE user NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','debian-sys-maint','backup','')")
+  done <<<"$users"
 }
 
 dump_sqlite() {
   STEP="SQLite-dumps"
-  local f owner name n=0 need avail
+  local f owner name n=0 need=0 avail files=()
   mkdir -p "$DUMP_DIR/sqlite"
-  need="$( { find /home -maxdepth 6 -type f \( -name '*.sqlite' -o -name '*.sqlite3' \) -printf '%s\n' 2>/dev/null || true; } | awk '{s+=$1} END {print s+0}')"
+  mapfile -d '' -t files < <(find /home -maxdepth 6 -type f \( -name '*.sqlite' -o -name '*.sqlite3' \) \
+    -not -path '*/node_modules/*' -not -path '*/vendor/*' -not -path '*/.git/*' -print0 2>/dev/null || true)
+  for f in "${files[@]}"; do need=$((need + $(stat -c %s "$f" 2>/dev/null || echo 0))); done
   avail="$(df -B1 --output=avail "$DUMP_DIR" | tail -1)"
   if [ "$((need * 3))" -gt "$avail" ]; then
     warn "te weinig schijfruimte voor SQLite-dumps ($((avail/1048576)) MB vrij): SQLite NIET apart gedumpt (de bestanden zelf gaan wel mee)"
     return 0
   fi
-  while IFS= read -r -d '' f; do
+  for f in "${files[@]}"; do
     [ "$(head -c 15 "$f" 2>/dev/null)" = "SQLite format 3" ] || continue
     owner="$(stat -c %U "$f")"
     name="$(printf '%s' "${f#/home/}" | tr '/' '_')"
@@ -581,8 +596,7 @@ dump_sqlite() {
       warn "SQLite-dump van $f mislukt: $(head -c 300 "$DUMP_DIR/sqlite/$name.err")"
       rm -f "$DUMP_DIR/sqlite/$name.sql.tmp"
     fi
-  done < <(find /home -maxdepth 6 -type f \( -name '*.sqlite' -o -name '*.sqlite3' \) \
-             -not -path '*/node_modules/*' -not -path '*/vendor/*' -not -path '*/.git/*' -print0 2>/dev/null)
+  done
   say "SQLite: $n databases gedumpt"
 }
 
@@ -603,6 +617,18 @@ backup_paths() {
   done < <(site_cache_paths)
 }
 
+# Einde van een run: oranje melding bij waarschuwingen, anders alleen Healthchecks
+report_done() {
+  trap - ERR
+  if [ "${#WARNINGS[@]}" -gt 0 ]; then
+    hc /fail
+    discord "🟠 **$1 op \`$SERVER_NAME\` klaar met waarschuwingen** ($ORG)
+$(printf -- '- %s\n' "${WARNINGS[@]}")"
+  else
+    hc
+  fi
+}
+
 # Alleen de dumps naar een eigen snapshot-reeks (tag db) met eigen bewaartermijn
 backup_db_only() {
   local t0="$1"
@@ -616,14 +642,7 @@ backup_db_only() {
   STEP="retentie (db)"
   r forget --host "$SERVER_NAME" --tag db --group-by host --retry-lock 10m \
     --keep-hourly "$KEEP_DB_HOURLY" --keep-daily "$KEEP_DB_DAILY"
-  trap - ERR
-  if [ "${#WARNINGS[@]}" -gt 0 ]; then
-    hc /fail
-    discord "🟠 **DB-backup op \`$SERVER_NAME\` klaar met waarschuwingen** ($ORG)
-$(printf -- '- %s\n' "${WARNINGS[@]}")"
-  else
-    hc
-  fi
+  report_done "DB-backup"
   say "===== db-backup klaar in $(( $(date +%s) - t0 ))s ====="
 }
 
@@ -636,6 +655,7 @@ cmd_backup() {
   if [ "$mode" = db ]; then LOG="$LOGDIR/last-db.log"; HC_SUFFIX="-db"; fi
   start_log "$LOG"
   trap on_error ERR
+  trap 'on_signal on_error' TERM HUP INT
   load_env
   say "===== backup $SERVER_NAME ($ORG, $mode) ====="
   STEP="configuratie"
@@ -653,7 +673,7 @@ cmd_backup() {
   fi
   hc /start
   lowprio_self
-  local t0; t0="$(date +%s)"
+  local t0 weekday; t0="$(date +%s)"; weekday="$(date +%u)"
 
   tools
   STEP="restic repo openen"
@@ -703,11 +723,12 @@ cmd_backup() {
 
   local snaps
   snaps="$(r snapshots --host "$SERVER_NAME" --tag ploi-backup --json)"
-  if [ "$(date +%u)" = "$REPORT_WEEKDAY" ]; then
+  if [ "$weekday" = "$REPORT_WEEKDAY" ]; then
     STEP="wekelijks prunen"
     r prune --retry-lock 10m
     STEP="integriteitscheck"
     r check --read-data-subset="$CHECK_SUBSET"
+    restic cache --cleanup >/dev/null 2>&1 || true
     local size
     size="$(r stats --mode raw-data --json | jq -r '.total_size')"
     discord "🟢 Weekrapport \`$SERVER_NAME\` ($ORG): $(jq length <<<"$snaps") snapshots, repo $((size/1048576)) MB, laatste backup $(jq -r '.[-1].summary | ((.total_bytes_processed/1048576|floor|tostring) + " MB verwerkt, " + (.data_added/1048576|floor|tostring) + " MB nieuw")' <<<"$snaps"), integriteitscheck ($CHECK_SUBSET) ok."
@@ -715,16 +736,8 @@ cmd_backup() {
     discord "🟢 Eerste backup van \`$SERVER_NAME\` ($ORG) klaar in $(( ($(date +%s) - t0) / 60 )) min: $(jq -r '.[-1].summary | (.total_bytes_processed/1048576|floor|tostring) + " MB"' <<<"$snaps")."
   fi
 
-  trap - ERR
+  report_done "Backup"
   local dur=$(( $(date +%s) - t0 ))
-  if [ "${#WARNINGS[@]}" -gt 0 ]; then
-    hc /fail
-    local w; w="$(printf -- '- %s\n' "${WARNINGS[@]}")"
-    discord "🟠 **Backup op \`$SERVER_NAME\` klaar met waarschuwingen** ($ORG)
-$w"
-  else
-    hc
-  fi
   say "===== klaar in $((dur/60))m$((dur%60))s ====="
 }
 
@@ -750,7 +763,7 @@ write_client_cnf() {
   ( umask 077
     { echo "[client]"; echo "user = $(cnf_quote "$2")"; echo "password = $(cnf_quote "$3")"
       [ -z "${4:-}" ] || echo "host = $(cnf_quote "$4")"
-      [ -z "${5:-}" ] || echo "port = $5"; } > "$1" )
+      [ -z "${5:-}" ] || echo "port = $5"; } > "$1.tmp" && mv -f "$1.tmp" "$1" )
 }
 
 # Waarde veilig tussen aanhalingstekens voor een MySQL-optiebestand (backslash en " escapen)
@@ -814,12 +827,31 @@ detect_site_db() {
   return 0
 }
 
-site_down() { [ -f "$1/artisan" ] && runuser -u "$2" -- php "$1/artisan" down >/dev/null 2>&1 && MAINT_DIR="$1" && MAINT_USER="$2"; return 0; }
+# Onderhoudsmodus tijdens terugzetten: Laravel/Statamic via artisan, WordPress via .maintenance.
+# Alles als de eigenaar van de site, zodat root nooit schrijft naar iets wat de site-user kan klaarzetten.
+site_down() { # site_down MAP EIGENAAR
+  MAINT_DIR="$1"; MAINT_USER="$2"; MAINT_WP=""
+  if [ -f "$1/artisan" ]; then
+    runuser -u "$2" -- php "$1/artisan" down >/dev/null 2>&1 || true
+    return 0
+  fi
+  local w
+  for w in "$1/public" "$1"; do
+    if [ -f "$w/wp-config.php" ] || [ -f "$w/wp-load.php" ]; then
+      # shellcheck disable=SC2016
+      runuser -u "$2" -- sh -c 'printf "<?php \$upgrading = time(); ?>" > "$1"' _ "$w/.maintenance" 2>/dev/null && MAINT_WP="$w/.maintenance"
+      return 0
+    fi
+  done
+}
 site_up() {
   [ -n "${MAINT_DIR:-}" ] || return 0
-  runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" optimize:clear >/dev/null 2>&1 || true
-  [ -f "$MAINT_DIR/please" ] && { runuser -u "$MAINT_USER" -- php "$MAINT_DIR/please" static:clear >/dev/null 2>&1 || true; }
-  runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" up >/dev/null 2>&1 || true
+  if [ -f "$MAINT_DIR/artisan" ]; then
+    runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" optimize:clear >/dev/null 2>&1 || true
+    [ ! -f "$MAINT_DIR/please" ] || runuser -u "$MAINT_USER" -- php "$MAINT_DIR/please" static:clear >/dev/null 2>&1 || true
+    runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" up >/dev/null 2>&1 || true
+  fi
+  [ -z "${MAINT_WP:-}" ] || rm -f "$MAINT_WP"
   MAINT_DIR=""
 }
 
@@ -828,6 +860,7 @@ restore_fail() {
   local rc="$1"
   if [ "$BASH_SUBSHELL" -gt 0 ]; then return "$rc"; fi
   rm -f "${RESTORE_CNF:-}"
+  [ -z "${RESTORE_TARGET:-}" ] || rm -rf "$RESTORE_TARGET"
   site_up
   on_error "$rc"
 }
@@ -993,6 +1026,7 @@ cmd_restore() {
   start_log "$LOGDIR/restore.log" append
   ACTION="Terugzetten"
   trap 'restore_fail $?' ERR
+  trap 'on_signal restore_fail' TERM HUP INT
   load_env
   [ -f "$ENV_FILE" ] || die "deze server is nog niet ingericht"
   if [ -z "$site" ]; then trap - ERR; cmd_list; return 0; fi
@@ -1017,7 +1051,9 @@ cmd_restore() {
 
   STEP="uit backup halen"
   local target="/root/restore-test/$site-$snap"
+  find /root/restore-test -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
   rm -rf "$target"; mkdir -p "$target"
+  RESTORE_TARGET="$target"
   r restore "$snap" --target "$target" --include "$live" --include "$DUMP_DIR" >/dev/null
   local src="$target$live" dumps="$target$DUMP_DIR"
   [ -d "$src" ] || die "site $live zit niet in backup $snap"
@@ -1045,6 +1081,7 @@ cmd_restore() {
   if [ "$apply" != 1 ]; then
     [ -n "$dump" ] && cp "$dump" "$target/database.sql"
     rm -rf "${target:?}/var"
+    RESTORE_TARGET=""
     say "PROEF klaar, er is niets live veranderd. Bestanden: $target${live}  Database-dump: ${dump:+$target/database.sql}"
     say "Echt terugzetten: zelfde opdracht met RESTORE_APPLY=1 (of --apply)."
     return 0
@@ -1071,8 +1108,8 @@ cmd_restore() {
     local keep=() p
     while IFS= read -r p; do keep+=(--exclude "$p"); done < <(site_cache_paths)
     rsync -a --delete "${keep[@]}" --exclude '*.sqlite' --exclude '*.sqlite3' \
-      --exclude '*.sqlite-wal' --exclude '*.sqlite-shm' "$src/" "$live/"
-    [ "$(stat -c %u "$src")" = "$(stat -c %u "$live")" ] || chown -R --reference="$live" "$live"
+      --exclude '*.sqlite-wal' --exclude '*.sqlite-shm' --exclude .maintenance "$src/" "$live/"
+    [ "$(stat -c %u:%g "$src")" = "$(stat -c %u:%g "$live")" ] || chown -R --reference="$live" "$live"
     say "Bestanden teruggezet"
   fi
   if [ -n "$dump" ]; then
@@ -1089,6 +1126,8 @@ cmd_restore() {
 # ======================================================================
 #  Ingangen
 # ======================================================================
+
+setup_abort() { say "setup gestopt in stap: $STEP"; exit "$1"; }
 
 # Nieuwe server: richt zichzelf in met de waarden uit het Ploi-script (PB_*).
 # Setup draait als apart proces; secrets gaan via de omgeving, nooit via argv of bestanden.
@@ -1136,7 +1175,7 @@ cmd_run() {
   systemctl reset-failed "$unit" >/dev/null 2>&1 || true
   systemd-run --unit="$unit" --description="ploi-backup $ORG $mode" --collect --quiet --setenv=HOME=/root \
     -p Nice=10 -p IOSchedulingClass=best-effort -p IOSchedulingPriority=7 \
-    -p CPUWeight=20 -p IOWeight=20 "$BIN" backup "$mode"
+    -p CPUWeight=20 -p IOWeight=20 -p RuntimeMaxSec=12h "$BIN" backup "$mode"
   say "Backup ($mode) gestart op de achtergrond (unit $unit)."
   say "Volgen: journalctl -u $unit -f    Log: $LOGDIR/"
 }
