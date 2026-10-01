@@ -25,6 +25,7 @@ echo "<html>static</html>" > "$SITE/public/static/index.html"
 echo "static-url-cache" > "$SITE/storage/statamic/static-urls-cache/a"
 echo "ref: refs/heads/main" > "$SITE/.git/HEAD"
 chown -R ploi:ploi "$SITE"
+mkdir -p /home/ploi/.ploi/backup-1-abc && head -c 1000 /dev/urandom > /home/ploi/.ploi/backup-1-abc/site.zip && head -c 1000 /dev/urandom > /home/ploi/.ploi/db-1.zip && echo log > /home/ploi/.ploi/cron.log
 
 WP=/home/ploi/wp.nl
 mkdir -p "$WP/public/wp-content/uploads/2026" "$WP/public/wp-content/cache" "$WP/public/wp-content/ai1wm-backups"
@@ -44,6 +45,36 @@ con.commit(); con.close()
 PY
 chown -R site-b:site-b /home/site-b
 '
+
+# Tweede WordPress-site: database en alle objecten van de site-user zelf (zoals op Ploi)
+docker exec -i "$C" bash -c 'set -e
+mkdir -p /home/ploi/wp2.nl/public/wp-content/uploads/2026
+head -c 100000 /dev/urandom > /home/ploi/wp2.nl/public/wp-content/uploads/2026/b.jpg
+cat > /home/ploi/wp2.nl/public/wp-config.php
+chown -R ploi:ploi /home/ploi/wp2.nl
+mysql -e "SET GLOBAL log_bin_trust_function_creators = 1; CREATE DATABASE IF NOT EXISTS wp_two; CREATE USER IF NOT EXISTS wp_two_user@localhost IDENTIFIED BY \"Two-Pass-123!\"; GRANT ALL ON wp_two.* TO wp_two_user@localhost"
+mysql -uwp_two_user -pTwo-Pass-123! wp_two -e "CREATE TABLE IF NOT EXISTS opts (id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(50)); CREATE TABLE IF NOT EXISTS log (id INT); INSERT INTO opts (v) SELECT CONCAT(\"v\", seq) FROM (WITH RECURSIVE s(seq) AS (SELECT 1 UNION ALL SELECT seq+1 FROM s WHERE seq < 300) SELECT seq FROM s) x; CREATE OR REPLACE VIEW opts_view AS SELECT id, v FROM opts; CREATE TRIGGER opts_ai AFTER INSERT ON opts FOR EACH ROW INSERT INTO log VALUES (NEW.id)" 2>/dev/null
+' <<'WPC'
+<?php
+define( 'DB_NAME', 'wp_two' );
+define( 'DB_USER', 'wp_two_user' );
+define( 'DB_PASSWORD', 'Two-Pass-123!' );
+define( 'DB_HOST', 'localhost' );
+WPC
+
+# Configbestanden via stdin (quotes blijven heel)
+docker exec -i "$C" bash -c 'cat > /home/ploi/wp.nl/public/wp-config.php && chown ploi:ploi /home/ploi/wp.nl/public/wp-config.php' <<'WPC'
+<?php
+define( 'DB_NAME', 'wp_test' );
+define( 'DB_USER', 'wp_test_user' );
+define( 'DB_PASSWORD', 'Wp-Pass-123!' );
+define( 'DB_HOST', 'localhost' );
+$table_prefix = 'wp_';
+WPC
+docker exec -i "$C" bash -c 'cat > /home/site-b/site-b.nl/.env && chown site-b:site-b /home/site-b/site-b.nl/.env' <<'ENV'
+APP_NAME=siteb
+DB_CONNECTION=sqlite
+ENV
 
 docker exec "$C" bash -c "
 set -e

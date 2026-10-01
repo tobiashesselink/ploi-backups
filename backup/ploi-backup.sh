@@ -128,6 +128,7 @@ tail_log() { if [ "${LOG_ACTIVE:-0}" = 1 ] && [ -f "$LOG" ]; then tail -n "${1:-
 
 on_error() {
   local rc=$?
+  [ -z "${1:-}" ] || rc="$1"
   # set -E erft de trap in $(...): daar alleen doorgeven, de buitenste shell meldt
   if [ "$BASH_SUBSHELL" -gt 0 ]; then return "$rc"; fi
   trap - ERR
@@ -136,7 +137,7 @@ on_error() {
   say "Gestopt met exitcode $rc in stap: $STEP"
   sleep 1
   hc /fail
-  discord "🔴 **Backup mislukt op \`$SERVER_NAME\`** ($ORG, stap: $STEP)
+  discord "🔴 **${ACTION:-Backup} mislukt op \`$SERVER_NAME\`** ($ORG, stap: $STEP)${PRE_SNAPSHOT:+ Veiligheidsbackup van vóór het terugzetten: \`$PRE_SNAPSHOT\`.}
 \`\`\`
 $(tail_log 15)
 \`\`\`"
@@ -361,7 +362,7 @@ provision_subaccount() {
     sub_id="$(jq -r '.subaccounts[0].id' <<<"$list")"
     if [ "${ADOPT:-}" != 1 ]; then
       ask ADOPT "Sub-account voor '$SERVER_NAME' bestaat al (herbouwde server?). Koppelen? Typ 1 als de oude server weg is"
-      [ "${ADOPT:-}" = 1 ] || die "bestaand sub-account niet gekoppeld (zet ADOPT=1 als dit de bedoeling is)"
+      [ "${ADOPT:-}" = 1 ] || die "er bestaan al backups voor '$SERVER_NAME'. Herbouwde server? Zet dan eenmalig PB_ADOPT=1 in het Ploi-script (zie README). Anders: kies een andere PB_SERVER_NAME"
     fi
     say "bestaand sub-account $sub_id koppelen: wachtwoord resetten"
     resp="$(api POST "/storage_boxes/$STORAGEBOX_ID/subaccounts/$sub_id/actions/reset_subaccount_password" \
@@ -435,6 +436,9 @@ cmd_setup() {
     done
   fi
   [ -n "${SETUP_SERVER_NAME:-}" ] && SERVER_NAME="$SETUP_SERVER_NAME"
+  STEP="servernaam"
+  [[ "$SERVER_NAME" =~ ^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$ ]] \
+    || die "ongeldige servernaam '$SERVER_NAME' (kleine letters, cijfers, - en .)"
   tools setup
   install_self
 
@@ -592,6 +596,8 @@ backup_paths() {
     --exclude '/home/*/.cache' --exclude '/home/*/.npm' --exclude '/home/*/.composer/cache'
     --exclude '/home/*/.config/composer/cache' --exclude '/home/*/.yarn' --exclude '/home/*/.pm2/logs'
     --exclude '/root/.cache' --exclude '/root/.npm' --exclude '/root/snap' --exclude '/root/restore-test'
+    # Tijdelijke bestanden van Ploi's eigen backups (mislukte runs laten zips van GB's achter)
+    --exclude '/home/*/.ploi/backup-*' --exclude '/home/*/.ploi/*.zip'
     --exclude '**/node_modules'
     # Laravel / Statamic: alles wat vanzelf opnieuw wordt opgebouwd
     --exclude '/home/*/*/storage/framework/cache' --exclude '/home/*/*/storage/framework/views'
@@ -704,6 +710,7 @@ cmd_backup() {
   STEP="retentie"
   r forget --host "$SERVER_NAME" --tag ploi-backup --group-by host --retry-lock 10m \
     --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY"
+  r forget --host "$SERVER_NAME" --tag pre-restore --group-by host --retry-lock 10m --keep-within 30d >/dev/null
 
   local snaps
   snaps="$(r snapshots --host "$SERVER_NAME" --tag ploi-backup --json)"
@@ -733,8 +740,286 @@ $w"
 }
 
 # ======================================================================
+#  Terugzetten: een site en de database die erbij hoort, samen
+# ======================================================================
+
+
+# env_value BESTAND KEY: waarde uit een .env (met of zonder aanhalingstekens)
+env_value() {
+  { grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null || true; } | tail -n 1 | sed -E \
+    -e "s/^[^=]*=[[:space:]]*//" -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\1/"
+}
+# wp_value BESTAND KEY: waarde uit define('KEY', 'waarde') in wp-config.php
+wp_value() {
+  { grep -E "define\([[:space:]]*['\"]$2['\"]" "$1" 2>/dev/null || true; } | head -n 1 | sed -E \
+    "s/.*define\([[:space:]]*['\"]$2['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/"
+}
+
+# pick_snapshot WANNEER: latest, een datum (JJJJ-MM-DD: laatste backup van die dag) of een snapshot-ID
+pick_snapshot() {
+  local all; all="$(r snapshots --host "$SERVER_NAME" --tag ploi-backup --json)"
+  case "${1:-latest}" in
+    latest) jq -r 'sort_by(.time) | .[-1].short_id // empty' <<<"$all" ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+      jq -r --arg d "$1" '[.[] | select(.time[0:10] <= $d)] | sort_by(.time) | .[-1].short_id // empty' <<<"$all" ;;
+    *) [[ "$1" =~ ^[0-9a-f]{8,64}$ ]] && echo "$1" ;;
+  esac
+}
+
+# Bepaalt welke database bij de site hoort, uit de teruggezette .env of wp-config.php.
+# Zet DB_KIND (mysql|sqlite|none), DB_NAME, DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_FILE
+detect_site_db() {
+  local src="$1" live="$2" conn cfg=""
+  DB_KIND=none; DB_NAME=""; DB_USER=""; DB_PASS=""; DB_HOST=127.0.0.1; DB_PORT=3306; DB_FILE=""
+  if [ -f "$src/.env" ]; then
+    conn="$(env_value "$src/.env" DB_CONNECTION)"
+    case "$conn" in
+      mysql|mariadb)
+        DB_KIND=mysql
+        DB_NAME="$(env_value "$src/.env" DB_DATABASE)"; DB_USER="$(env_value "$src/.env" DB_USERNAME)"
+        DB_PASS="$(env_value "$src/.env" DB_PASSWORD)"
+        DB_HOST="$(env_value "$src/.env" DB_HOST)"; DB_PORT="$(env_value "$src/.env" DB_PORT)" ;;
+      sqlite)
+        DB_KIND=sqlite
+        DB_FILE="$(env_value "$src/.env" DB_DATABASE)"
+        case "$DB_FILE" in
+          "") DB_FILE="$live/database/database.sqlite" ;;
+          /*) ;;
+          *) DB_FILE="$live/$DB_FILE" ;;
+        esac ;;
+    esac
+  else
+    for cfg in "$src/wp-config.php" "$src/public/wp-config.php"; do [ -f "$cfg" ] && break; cfg=""; done
+    if [ -n "$cfg" ]; then
+      DB_KIND=mysql
+      DB_NAME="$(wp_value "$cfg" DB_NAME)"; DB_USER="$(wp_value "$cfg" DB_USER)"
+      DB_PASS="$(wp_value "$cfg" DB_PASSWORD)"; DB_HOST="$(wp_value "$cfg" DB_HOST)"
+    fi
+  fi
+  DB_HOST="${DB_HOST:-127.0.0.1}"; DB_PORT="${DB_PORT:-3306}"
+  if [[ "$DB_HOST" == *:* ]]; then DB_PORT="${DB_HOST##*:}"; DB_HOST="${DB_HOST%%:*}"; fi
+  [ "$DB_HOST" = localhost ] && DB_HOST=127.0.0.1
+  return 0
+}
+
+site_down() { [ -f "$1/artisan" ] && runuser -u "$2" -- php "$1/artisan" down >/dev/null 2>&1 && MAINT_DIR="$1" && MAINT_USER="$2"; return 0; }
+site_up() {
+  [ -n "${MAINT_DIR:-}" ] || return 0
+  runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" optimize:clear >/dev/null 2>&1 || true
+  [ -f "$MAINT_DIR/please" ] && { runuser -u "$MAINT_USER" -- php "$MAINT_DIR/please" static:clear >/dev/null 2>&1 || true; }
+  runuser -u "$MAINT_USER" -- php "$MAINT_DIR/artisan" up >/dev/null 2>&1 || true
+  MAINT_DIR=""
+}
+
+# Bij een fout tijdens terugzetten: site uit onderhoud halen, dan de gewone foutmelding
+restore_fail() {
+  local rc="$1"
+  if [ "$BASH_SUBSHELL" -gt 0 ]; then return "$rc"; fi
+  rm -f "${RESTORE_CNF:-}"
+  site_up
+  on_error "$rc"
+}
+
+# cmd_restore [SITE] [--when X] [--apply] [--files-only|--db-only]
+# Of via omgeving (Ploi-script): RESTORE_SITE, RESTORE_WHEN, RESTORE_APPLY=1, RESTORE_PART=files|db
+cmd_restore() {
+  local site="${RESTORE_SITE:-}" when="${RESTORE_WHEN:-latest}" apply="${RESTORE_APPLY:-0}" part="${RESTORE_PART:-all}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1 ;;
+      --when) when="${2:-}"; shift ;;
+      --when=*) when="${1#--when=}" ;;
+      --files-only) part=files ;;
+      --db-only) part=db ;;
+      -*) die "onbekende optie $1" ;;
+      *) site="$1" ;;
+    esac
+    shift
+  done
+  need_root
+  mkdir -p "$LOGDIR"
+  start_log "$LOGDIR/restore.log" append
+  ACTION="Terugzetten"
+  trap 'restore_fail $?' ERR
+  load_env
+  [ -f "$ENV_FILE" ] || die "deze server is nog niet ingericht"
+  STEP="snapshots"
+  if [ -z "$site" ]; then
+    say "Beschikbare backups van $SERVER_NAME (kies met RESTORE_WHEN een datum of ID):"
+    r snapshots --host "$SERVER_NAME" --tag ploi-backup --compact
+    say "Sites: $(find /home -mindepth 2 -maxdepth 2 -type d -name '*.*' -printf '%f ' 2>/dev/null)"
+    return 0
+  fi
+  [[ "$site" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "ongeldige sitenaam '$site'"
+  case "$part" in all|files|db) ;; *) die "RESTORE_PART moet all, files of db zijn" ;; esac
+
+  # Paden die niet in de backup zitten (caches): rsync laat ze bij terugzetten met rust
+  local rsync_keep=(--exclude node_modules --exclude /storage/framework/cache --exclude /storage/framework/views
+    --exclude /storage/framework/sessions --exclude /storage/statamic/static-urls-cache --exclude /storage/statamic/glide
+    --exclude /storage/statamic/stache-locks --exclude /storage/statamic/static --exclude /public/static
+    --exclude wp-content/cache --exclude wp-content/et-cache --exclude wp-content/litespeed
+    --exclude '*.sqlite' --exclude '*.sqlite3' --exclude '*.sqlite-wal' --exclude '*.sqlite-shm')
+  STEP="tools"
+  apt_install rsync
+  STEP="lock"
+  exec 9>"$LOCK"
+  flock -w 900 9 || die "er draait al een backup; probeer het over een paar minuten opnieuw"
+
+  STEP="snapshot kiezen"
+  local snap; snap="$(pick_snapshot "$when")"
+  [ -n "$snap" ] || die "geen backup gevonden voor '$when' (zie: ploi-backup restore zonder site)"
+  local stime; stime="$(r snapshots "$snap" --json | jq -r '.[0].time[0:16] | sub("T"; " ")')"
+
+  STEP="site zoeken"
+  local live="" d
+  for d in /home/*/"$site"; do [ -d "$d" ] && { [ -z "$live" ] || die "site $site staat meerdere keren in /home"; live="$d"; }; done
+  if [ -z "$live" ]; then
+    live="$(r ls --json "$snap" /home 2>/dev/null | jq -r --arg s "$site" \
+      'select(.type == "dir") | .path | select((split("/") | length) == 4 and (split("/") | .[3]) == $s)' | head -n 1)"
+    [ -n "$live" ] || die "site $site staat niet op deze server en niet in backup $snap"
+    [ "$apply" = 1 ] && die "site $live bestaat nog niet op deze server: maak hem eerst aan in Ploi"
+  fi
+  say "Site: $live, backup: $snap ($stime UTC), deel: $part, $([ "$apply" = 1 ] && echo 'ECHT TERUGZETTEN' || echo 'proef')"
+
+  STEP="uit backup halen"
+  local T="/root/restore-test/$site-$snap"
+  rm -rf "$T"; mkdir -p "$T"
+  r restore "$snap" --target "$T" --include "$live" --include "$DUMP_DIR" >/dev/null
+  local src="$T$live" dumps="$T$DUMP_DIR"
+  [ -d "$src" ] || die "site $live zit niet in backup $snap"
+
+  detect_site_db "$src" "$live"
+  local dump=""
+  case "$DB_KIND" in
+    mysql)  dump="$dumps/mysql/$DB_NAME.sql" ;;
+    sqlite) dump="$dumps/sqlite/$(printf '%s' "${DB_FILE#/home/}" | tr '/' '_').sql" ;;
+  esac
+  if [ "$DB_KIND" = none ]; then say "Database: geen (geen .env met DB_CONNECTION en geen wp-config.php)"
+  elif [ -f "$dump" ]; then say "Database: $DB_KIND ${DB_NAME:-$DB_FILE}, dump $(du -h "$dump" | cut -f1)"
+  else
+    [ "$part" = files ] || die "geen dump van ${DB_NAME:-$DB_FILE} in backup $snap"
+    dump=""
+  fi
+
+  if [ "$apply" != 1 ]; then
+    [ -n "$dump" ] && cp "$dump" "$T/database.sql"
+    rm -rf "${T:?}/var"
+    say "PROEF klaar, er is niets live veranderd. Bestanden: $T${live}  Database-dump: ${dump:+$T/database.sql}"
+    say "Echt terugzetten: zelfde opdracht met RESTORE_APPLY=1 (of --apply)."
+    return 0
+  fi
+
+  local owner; owner="$(stat -c %U "$live")"
+  local my=()
+  if [ "$part" != files ] && [ -n "$dump" ] && [ "$DB_KIND" = mysql ]; then
+    # Eerst controleren of het kan, vóórdat er iets live verandert
+    STEP="database controleren"
+    RESTORE_CNF="$STATE/restore-db.cnf"
+    ( umask 077; printf '[client]\nuser = "%s"\npassword = "%s"\nhost = "%s"\nport = %s\n' "$DB_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" > "$RESTORE_CNF" )
+    my=(mysql --defaults-file="$RESTORE_CNF" -N -B)
+    if ! "${my[@]}" -e "SELECT 1" "$DB_NAME" >/dev/null 2>&1; then
+      # Lokaal via de socket (users die alleen @localhost mogen)
+      ( umask 077; printf '[client]\nuser = "%s"\npassword = "%s"\n' "$DB_USER" "$DB_PASS" > "$RESTORE_CNF" )
+      "${my[@]}" -e "SELECT 1" "$DB_NAME" >/dev/null || die "inloggen op $DB_NAME met de gegevens uit de site lukt niet"
+    fi
+    local foreign
+    foreign="$("${my[@]}" -e "SELECT GROUP_CONCAT(CONCAT(t, ' ', n) SEPARATOR ', ') FROM (
+        SELECT 'view' t, table_name n, definer d FROM information_schema.views WHERE table_schema = DATABASE()
+        UNION ALL SELECT 'trigger', trigger_name, definer FROM information_schema.triggers WHERE trigger_schema = DATABASE()
+        UNION ALL SELECT 'routine', routine_name, definer FROM information_schema.routines WHERE routine_schema = DATABASE()
+        UNION ALL SELECT 'event', event_name, definer FROM information_schema.events WHERE event_schema = DATABASE()) x
+        WHERE SUBSTRING_INDEX(d, '@', 1) <> SUBSTRING_INDEX(CURRENT_USER(), '@', 1)" "$DB_NAME")"
+    # Met binlog aan mag een gewone user alleen triggers/routines maken als log_bin_trust_function_creators=1
+    if grep -qE '^/\*!50003 (CREATE\*/|TRIGGER)|^CREATE[^;]*(PROCEDURE|FUNCTION)' "$dump" \
+       && [ "$("${my[@]}" -e "SELECT @@log_bin AND NOT @@log_bin_trust_function_creators" "$DB_NAME")" = 1 ]; then
+      die "de backup van $DB_NAME bevat triggers of routines, en MySQL staat dat de site-user niet toe (binlog aan). Er is niets veranderd. Zet de database terug als MySQL-root (zie README)"
+    fi
+    if [ -n "$foreign" ] && [ "$foreign" != NULL ]; then
+      die "$DB_NAME bevat objecten van een andere MySQL-user ($foreign); de site-user mag die niet vervangen. Er is niets veranderd. Zet de database terug als MySQL-root (zie README)"
+    fi
+  fi
+
+  STEP="veiligheidsbackup van de huidige staat"
+  rm -rf "$DUMP_DIR"; mkdir -p "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
+  dump_mysql; dump_sqlite
+  local pre
+  pre="$(r backup "$live" "$DUMP_DIR" --host "$SERVER_NAME" --tag pre-restore --json --quiet \
+    | jq -r 'select(.message_type == "summary") | .snapshot_id[0:8]')"
+  rm -rf "$DUMP_DIR"
+  [ -n "$pre" ] || die "veiligheidsbackup mislukt, er is niets veranderd"
+  say "Veiligheidsbackup van vóór het terugzetten: $pre (terugdraaien: RESTORE_WHEN=$pre)"
+  PRE_SNAPSHOT="$pre"
+
+  site_down "$live" "$owner"
+  if [ "$part" != db ]; then
+    STEP="bestanden terugzetten"
+    rsync -a --delete "${rsync_keep[@]}" "$src/" "$live/"
+    [ "$(stat -c %u "$src")" = "$(stat -c %u "$live")" ] || chown -R --reference="$live" "$live"
+    say "Bestanden teruggezet"
+  fi
+  if [ "$part" != files ] && [ -n "$dump" ]; then
+    STEP="database terugzetten"
+    if [ "$DB_KIND" = mysql ]; then
+      # De dump vervangt elke tabel zelf (DROP ... IF EXISTS). DEFINER weg: objecten komen op naam van de site-user.
+      # shellcheck disable=SC2016
+      sed -E 's/DEFINER=`[^`]+`@`[^`]+`//g' "$dump" | "${my[@]}" "$DB_NAME" \
+        || die "importeren van $DB_NAME mislukt; zet zo nodig de veiligheidsbackup $pre terug"
+      # Daarna wat er sinds de backup is bijgekomen weghalen, zodat de database precies gelijk is
+      local keep extra t
+      # shellcheck disable=SC2016
+      keep="$(grep -oE '^CREATE TABLE `[^`]+`|^/\*!50001 VIEW `[^`]+`|^/\*!50001 CREATE VIEW `[^`]+`' "$dump" | grep -oE '`[^`]+`$' | tr -d '`' | sort -u)"
+      extra="$("${my[@]}" -e "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()" "$DB_NAME" | sort -u)"
+      for t in $(comm -13 <(printf '%s\n' "$keep") <(printf '%s\n' "$extra")); do
+        if "${my[@]}" -e "SET FOREIGN_KEY_CHECKS=0; DROP VIEW IF EXISTS \`$t\`; DROP TABLE IF EXISTS \`$t\`" "$DB_NAME" 2>/dev/null; then
+          say "tabel $t (aangemaakt na de backup) verwijderd"
+        else
+          warn "tabel $t kon niet weg"
+        fi
+      done
+      rm -f "$RESTORE_CNF"
+    else
+      local tmpdb="$DB_FILE.restore-$$"
+      runuser -u "$owner" -- sqlite3 "$tmpdb" < "$dump"
+      [ "$(runuser -u "$owner" -- sqlite3 "$tmpdb" 'PRAGMA integrity_check')" = ok ] || { rm -f "$tmpdb"; die "SQLite-controle mislukt"; }
+      rm -f "$DB_FILE-wal" "$DB_FILE-shm"
+      mv -f "$tmpdb" "$DB_FILE"
+    fi
+    say "Database teruggezet"
+  fi
+  site_up
+  trap - ERR
+  rm -rf "$T"
+  say "===== $site teruggezet naar $stime UTC ====="
+  discord "♻️ \`$site\` op \`$SERVER_NAME\` teruggezet naar de backup van $stime UTC ($part). Veiligheidsbackup van daarvoor: \`$pre\`."
+}
+
+# ======================================================================
 #  Ingangen
 # ======================================================================
+
+# Nieuwe server: richt zichzelf in met de waarden uit het Ploi-script (PB_*).
+# Setup draait als apart proces; secrets gaan via de omgeving, nooit via argv of bestanden.
+auto_setup() {
+  STEP="automatisch inrichten"
+  local host; host="$(hostname -s)"
+  if [ -z "${PB_RESTIC_PASSWORD:-}" ] || { [ -z "${PB_HETZNER_TOKEN:-}" ] && [ -z "${SB_PASSWORD:-}" ]; }; then
+    say "Nieuwe server: vul PB_HETZNER_TOKEN en PB_RESTIC_PASSWORD in het Ploi-script in en run het opnieuw."
+    discord "🔧 \`$host\` ($ORG) is nog niet gekoppeld. Vul \`PB_HETZNER_TOKEN\` in het Ploi-script in, run het op deze server en maak het token daarna weer leeg."
+    hc /fail
+    exit 1
+  fi
+  say "Nieuwe server: automatisch inrichten (duurt 1-3 minuten)"
+  if ! HETZNER_TOKEN="${PB_HETZNER_TOKEN:-}" RESTIC_PASSWORD="$PB_RESTIC_PASSWORD" \
+       SETUP_MYSQL="${PB_SETUP_MYSQL:-1}" SETUP_SERVER_NAME="${PB_SERVER_NAME:-}" ADOPT="${PB_ADOPT:-}" \
+       "$BIN" setup </dev/null; then
+    discord "🔴 **Inrichten mislukt op \`$host\`** ($ORG)
+\`\`\`
+$(tail -n 12 "$LOGDIR/setup.log" 2>/dev/null | cut -c1-200)
+\`\`\`"
+    hc /fail
+    exit 1
+  fi
+}
 
 # cmd_run [full|db]: start vanuit Ploi op de achtergrond
 cmd_run() {
@@ -745,11 +1030,11 @@ cmd_run() {
   load_env
   trap on_error ERR
   install_self
-  if [ ! -f "$ENV_FILE" ]; then
-    say "Deze server is nog niet ingericht. Eenmalig als root: $BIN setup"
-    discord "🔧 \`$(hostname -s)\` ($ORG): backup nog niet ingericht. Eenmalig als root: \`$BIN setup\`"
-    exit 1
+  if [ ! -f "$ENV_FILE" ]; then auto_setup; load_env; fi
+  if [ -n "${PB_HETZNER_TOKEN:-}" ]; then
+    say "Server is ingericht. Je kunt PB_HETZNER_TOKEN in het Ploi-script weer leegmaken."
   fi
+  unset PB_HETZNER_TOKEN PB_RESTIC_PASSWORD
   if ! command -v systemd-run >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then trap - ERR; exec "$BIN" backup "$mode"; fi
   if systemctl is-active -q "$unit" 2>/dev/null; then
     say "backup draait al (journalctl -u $unit -f)"
@@ -787,6 +1072,8 @@ Gebruik: $BIN [run|setup|backup|status|restic ...]
   setup   eenmalig inrichten (vraagt Hetzner-token en restic-wachtwoord)
   backup  backup in de voorgrond: backup [full|db] (FORCE=1 negeert de lege-server-check)
   status  laatste snapshots en log
+  restore site + database terugzetten: restore SITE [--when latest|JJJJ-MM-DD|ID] [--apply] [--files-only|--db-only]
+          zonder --apply: proef naar /root/restore-test, er verandert niets live
   restic  restic met de juiste repo en wachtwoord, bv: $BIN restic snapshots
 USAGE
 }
@@ -809,6 +1096,7 @@ main() {
     backup) cmd_backup "${2:-full}" ;;
     status) cmd_status ;;
     restic) shift; cmd_restic "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
     -h|--help|help) usage ;;
     *) usage; exit 2 ;;
   esac
