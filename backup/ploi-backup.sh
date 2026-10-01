@@ -904,7 +904,7 @@ cmd_list() {
       printf '  %-9s %-16s  %-10s %9s %9s\n' "$id" "$t" "$kind" "$(human "$tot")" "$(human "$new")"
     done <<<"$rows"
     echo "Opslag op de Storage Box (versleuteld, ontdubbeld): $(human "$(r stats --mode raw-data --json | jq -r '.total_size')")"
-    echo "Sites: $(find /home -mindepth 2 -maxdepth 2 -type d -name '*.*' -printf '%f ' 2>/dev/null)"
+    echo "Sites: $(find /home -mindepth 2 -maxdepth 2 -type d -name '*.*' -not -name '.*' -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')"
     echo "Details van één site: ploi-backup list SITE. Terugzetten: RESTORE_SITE=SITE RESTORE_WHEN=ID."
     return 0
   fi
@@ -1082,7 +1082,9 @@ cmd_restore() {
     [ -n "$dump" ] && cp "$dump" "$target/database.sql"
     rm -rf "${target:?}/var"
     RESTORE_TARGET=""
-    say "PROEF klaar, er is niets live veranderd. Bestanden: $target${live}  Database-dump: ${dump:+$target/database.sql}"
+    say "PROEF klaar, er is niets live veranderd."
+    [ "$part" = db ] || say "Bestanden: $target$live"
+    [ -z "$dump" ] || say "Database-dump: $target/database.sql"
     say "Echt terugzetten: zelfde opdracht met RESTORE_APPLY=1 (of --apply)."
     return 0
   fi

@@ -10,8 +10,8 @@ export PB_DISCORD_WEBHOOK=""     # Discord-kanaal > Integraties > Webhook-URL
 export PB_HC_PING_KEY=""         # optioneel: Healthchecks.io ping key
 export PB_HETZNER_TOKEN=""       # alleen invullen om een nieuwe server te koppelen, daarna weer leeg
 # ---- Versie (alleen aanpassen bij een update, zie README) -----------
-VERSION="v1.1.0"
-SHA256="d56c8ac45b5461fffa07b7186e4ac99c193e5ea1f7ec2dc439ba607a78b81e84"
+VERSION="v1.1.1"
+SHA256="2d0d9cfb1c371e7814b32d89cab4d30daaa044d53a3dbf2226cdeaae74ff6687"
 # ---------------------------------------------------------------------
 set -euo pipefail
 URL="https://raw.githubusercontent.com/tobiashesselink/ploi-backups/$VERSION/backup/ploi-backup.sh"
