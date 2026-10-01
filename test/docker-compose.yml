@@ -1,0 +1,19 @@
+services:
+  storagebox:
+    build: ./storagebox
+    hostname: storagebox
+    container_name: ploi-test-storagebox
+    networks:
+      - testnet
+
+  server:
+    build: ./server
+    hostname: server
+    container_name: ploi-test-server
+    depends_on:
+      - storagebox
+    networks:
+      - testnet
+
+networks:
+  testnet:
